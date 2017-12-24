@@ -21,13 +21,15 @@ graph LR
 	```python
 	# -------------------------------------------
 	import dis
-	dis.dis(mod)	# 使用dis模块获取bytecode
+	dis.dis(mod)	# 使用dis模块获取mod的bytecode
 	# -------------------------------------------
-	c = compile('test.py', 'test.py', 'exec')	# 返回code object
-	# 返回bytecode的数字编码 [101, 0, 0, 106, 1, 0, 1, 100, 0, 0, 83]
+	c = compile(open('test.py').read(), 'test.py', 'exec')	# 返回code object
+	# 返回bytecode的数字编码 [100, 0, 0, 90, 0, 0, 100,....]
 	[ord(byte) for byte in c.co_code]
-	dis.dis(c)	# 返回bytecode of what???
+	dis.dis(c)	# 返回bytecode
 	dir(c) # 返回c中主要信息
+	c.co_code # 返回汇编代码
+	c.co_consts # 返回常量元组
 	```
 	```shell
 	python -m dis test.py
