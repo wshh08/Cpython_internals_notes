@@ -67,6 +67,7 @@
 				*/
 				CASE LOAD_FAST: ... break;
 				CASE LOAD_CONST: ... break;
+				...
 				}
 			// line 2959-2960: kick out the infinite loop
 			if (why != WHY_NOT)
@@ -264,7 +265,7 @@
 		 * in addition, be cast to PyVarObject*.
 		 */
 	typedef struct _object {
-   		PyObject_HEAD
+   		PyObject_HEAD	// subtype
 	} PyObject;
 
 	/* Macros to get reference count, type and size from Python Objects */
@@ -301,17 +302,6 @@
 	    PyObject *res = _PyObject_Str(v);
 	    if (res == NULL)
 	        return NULL;
-	#ifdef Py_USING_UNICODE
-	    if (PyUnicode_Check(res)) {
-	        PyObject* str;
-	        str = PyUnicode_AsEncodedString(res, NULL, NULL);
-	        Py_DECREF(res);
-	        if (str)
-	            res = str;
-	        else
-	            return NULL;
-	    }
-	#endif
 	    assert(PyString_Check(res));
 	    return res;
 	}
@@ -327,12 +317,6 @@
 	        Py_INCREF(v);
 	        return v;
 	    }
-	#ifdef Py_USING_UNICODE
-	    if (PyUnicode_CheckExact(v)) {
-	        Py_INCREF(v);
-	        return v;
-	    }
-	#endif
 	    if (Py_TYPE(v)->tp_str == NULL)
 	        return PyObject_Repr(v);
 
@@ -348,18 +332,11 @@
 		   for each type.
 		 */
 	    res = (*Py_TYPE(v)->tp_str)(v);
-	    Py_LeaveRecursiveCall();
 	    if (res == NULL)
 	        return NULL;
 	    type_ok = PyString_Check(res);
-	#ifdef Py_USING_UNICODE
-	    type_ok = type_ok || PyUnicode_Check(res);
-	#endif
 	    if (!type_ok) {
-	        PyErr_Format(PyExc_TypeError,
-	                     "__str__ returned non-string (type %.200s)",
-	                     Py_TYPE(res)->tp_name);
-	        Py_DECREF(res);
+			...
 	        return NULL;
 	    }
 	    return res;
@@ -373,10 +350,369 @@
 	- Intro to Python sequence types -- tuples, lists, strings
 	- Abstract object interface: **Objects/abstract.c**
 	- String type: **Objects/stringobject.c**
+1. Differences between Tuple List and String in Python:
+	- ```Tuple``` is immutable, ```List``` is mutable and variable length, ```String``` is a sequence of characters(can be accessed by index), it's immutable.
+1. About the String object:
+	- ![Pic1](pics/Lecture5_01.png)
+	- line 35-49 in **Include/stringobject.h**: definition of PyStringObject
+	```c
+	typedef struct {
+	    PyObject_VAR_HEAD	// ref-count & type pointer & size
+	    long ob_shash;	// Hash cache
+	    int ob_sstate;	// String interned or not
+		/* Memmory for storing characters will be allocated by malloc() right after ob_sval
+		   Once an PyObject struct is casted to a PyStringObject, we can access
+		   characters by offeset to the ob_sval.
+		 */
+	    char ob_sval[1];
+
+	    /* Invariants(不变的):
+	     *     ob_sval contains space for 'ob_size+1' elements.
+	     *     ob_sval[ob_size] == 0.
+	     *     ob_shash is the hash of the string or -1 if not computed yet.
+	     *     ob_sstate != 0 iff the string object is in stringobject.c's
+	     *       'interned' dictionary; in this case the two references
+	     *       from 'interned' to this object are *not counted* in ob_refcnt.
+	     */
+	} PyStringObject;
+	```
+1. In Python ```x == y``` means content of x and y is equal. but ```x is y``` means id(x) equals to id(y), so to speak the variable x and y is associated to the same object, and address of this object must be equal.
+	- ![Pic1](pics/Lecture5_02.png)
+	- line 2275-2308 and line 4463-4543 in **Include/ceval.c**: Implementation of instruction ```COMPARE_OP``` in python
+	```c
+    case COMPARE_OP:
+        w = POP();
+        v = TOP();
+		// if both integers, go inside this.
+        if (PyInt_CheckExact(w) && PyInt_CheckExact(v)) {
+			...
+        }
+        else {
+          slow_compare:
+		  	/* oparg: argument of instruction, "==", ">", "<=" or "is" and so on */
+            x = cmp_outcome(oparg, v, w);
+        }
+		...
+        continue;
+
+	static PyObject *
+	cmp_outcome(int op, register PyObject *v, register PyObject *w)
+	{
+	    int res = 0;
+		/* switch based on the operation */
+	    switch (op) {
+	    case PyCmp_IS:
+			/* what an 'is' operator does in python is
+			   just checking two pointers make sure it's equal,
+			   it can be very fast
+			*/
+	        res = (v == w);
+	        break;
+	    case PyCmp_IS_NOT:
+	        res = (v != w);
+	        break;
+	    case PyCmp_IN:
+	        res = PySequence_Contains(w, v);
+	        if (res < 0)
+	            return NULL;
+	        break;
+	    case PyCmp_NOT_IN:
+	        res = PySequence_Contains(w, v);
+	        if (res < 0)
+	            return NULL;
+	        res = !res;
+	        break;
+	    case PyCmp_EXC_MATCH:
+			...
+	    default:
+			/* the most general compare function PyObject_RichCompare(...) defined in Objects/object.c */
+	        return PyObject_RichCompare(v, w, op);
+	    }
+	    v = res ? Py_True : Py_False;
+	    Py_INCREF(v);
+	    return v;
+	}
+	```
+	- line 593-595 943-979 in **Objects/object.c**: PyObject_RichCompare(...), the most general compare function.
+	```c
+	/* Macro to get the tp_richcompare field of a type if defined */
+	#define RICHCOMPARE(t) (PyType_HasFeature((t), Py_TPFLAGS_HAVE_RICHCOMPARE) \
+	             ? (t)->tp_richcompare : NULL)
+	/* tp_richcompare is a field in struct PyString_Type(defined in line 3838 of 'Objects/stringobject.c'):
+	 * PyTypeObject PyString_Type = {
+	 * ...
+	 * * function string_richcompare implemented in line 1191 of 'Objects/stringobject.c'
+     * (richcmpfunc)string_richcompare,            /* tp_richcompare
+	 * ...
+	 * };
+	 *
+	 * definition of function pointer type 'richcmpfunc' in Objects/object.h
+	 * typedef PyObject *(*richcmpfunc) (PyObject *, PyObject *, int);
+	 */
+
+	PyObject *
+	PyObject_RichCompare(PyObject *v, PyObject *w, int op
+	{
+	    PyObject *res;
+
+	    assert(Py_LT <= op && op <= Py_GE);
+	    if (Py_EnterRecursiveCall(" in cmp"))
+	        return NULL;
+
+	    /* If the types are equal, and not old-style instances, try to
+	       get out cheap (don't bother with coercions etc.). */
+	    if (v->ob_type == w->ob_type && !PyInstance_Check(v)) {
+	        cmpfunc fcmp;
+			/* grab the field 'tp_richcompare'(a function pointer) out from the type object and then apply it */
+	        richcmpfunc frich = RICHCOMPARE(v->ob_type);
+	        /* If the type has richcmp, try it first.  try_rich_compare
+	           tries it two-sided, which is not needed since we've a
+	           single type only. */
+	        if (frich != NULL) {
+	            res = (*frich)(v, w, op);
+	            if (res != Py_NotImplemented)
+	                goto Done;
+	            Py_DECREF(res);
+	        }
+	        /* No richcmp, or this particular richmp not implemented.
+	           Try 3-way cmp. */
+	        fcmp = v->ob_type->tp_compare;
+	        if (fcmp != NULL) {
+	            int c = (*fcmp)(v, w);
+	            c = adjust_tp_compare(c);
+	            if (c == -2) {
+	                res = NULL;
+	                goto Done;
+	            }
+	            res = convert_3way_to_object(op, c);
+	            goto Done;
+	        }
+	    }
+	```
+	- 流程图总结：
+	```viz
+	digraph COMPARE_OP {
+  	rankdir=LR
+    node[shape=record]
+	interpreter[label="interpreter(ceval.c) | instruction COMPARE_OP &#92;n function cmp_outcome"];
+	object[label = "generic object(object.c) | PyObject_RichCompare(...) &#92;n RICHCOMPARE(v→ob_type)"];
+	stringobject[label = "string object(stringobject.c) | PyTypeObject PyString_Type &#92;n field tp_richcompare &#92;n function string_richCompare(...)"];
+	interpreter -> object;
+	object -> stringobject;
+	}
+	```
 
 ##### Lecture 6 - Code objects, function objects, and closures
 
+1. Objective: To understand how Python functions are simply PyObject structures
+	- Code objects
+	- Function objects
+	- Closures
+1. Contents of a function object:
+	- foo.func_name: Function name
+	- foo.func_dict
+	- foo.func_globals: pointer to the global dictionary, when you want to access a global variable in your function code, you can know where to access. As if there is only one global dictionary, why does each function object need a pointer to it? Why don't use just one global pointer that everyone can use it to access global dictionary? Because, if your project has 10 different files, each file would have a different global, each function need to track its own globals.
+	- foo.func_code: pointer of a code object, holding the byte coode of the function.
+	```viz
+	digraph FUNC_OBJ {
+		rankdir = LR;
+		node [shape=record];
+		function_obj[label="Function Object | func_name | <f0>func_globals | <f1>func_code"];
+		globals[label="<f0>Global Dictionary | different | from | each | .py file | ... "];
+		code_obj[label="Code Object | <f0>co_code | co_consts | co_filename | co_names"]
+		bytecode[label="<f0>byte code | ..."];
+		function_obj:f0 -> globals:f0;
+		function_obj:f1 -> code_obj;
+		code_obj:f0 -> bytecode:f0;
+	}
+	```
+1. **NOTE**: the function object isn't created until you actually execute the line of code that define the function. But all the code objects have actually been precompiled, the code object is made during the compilation stage.
+1. 代码解析：
+	- line 10-30 in **Include/code.h**: Definition of code object, these information can be accessed by ```foo.co_code.xxxx```, the code object doesn't contain any pointer to the global variables.
+	```c
+	/* Bytecode object */
+	typedef struct {
+	    PyObject_HEAD
+	    int co_argcount;		/* #arguments, except *args */
+	    int co_nlocals;		/* #local variables */
+	    int co_stacksize;		/* #entries needed for evaluation stack */
+	    int co_flags;		/* CO_..., see below */
+	    PyObject *co_code;		/* instruction opcodes */
+	    PyObject *co_consts;	/* list (constants used) */
+	    PyObject *co_names;		/* list of strings (names used) */
+	    PyObject *co_varnames;	/* tuple of strings (local variable names) */
+	    PyObject *co_freevars;	/* tuple of strings (free variable names) */
+	    PyObject *co_cellvars;      /* tuple of strings (cell variable names) */
+	    /* The rest doesn't count for hash/cmp */
+	    PyObject *co_filename;	/* string (where it was loaded from) */
+	    PyObject *co_name;		/* string (name, for reference) */
+	    int co_firstlineno;		/* first source line number */
+	    PyObject *co_lnotab;	/* string (encoding addr<->lineno mapping) See
+					   Objects/lnotab_notes.txt for details. */
+	    void *co_zombieframe;     /* for optimization only (see frameobject.c) */
+	    PyObject *co_weakreflist;   /* to support weakrefs to code objects */
+	} PyCodeObject;
+	```
+	- line 43-109 in **Objects/codeobject.c**: Constructor of the code object.
+	```c
+	PyCodeObject *
+	PyCode_New(int argcount, int nlocals, int stacksize, int flags,
+	           PyObject *code, PyObject *consts, PyObject *names,
+	           PyObject *varnames, PyObject *freevars, PyObject *cellvars,
+	           PyObject *filename, PyObject *name, int firstlineno,
+	           PyObject *lnotab)
+	{
+	    /* Check argument types */
+		...
+	    /* Intern selected string constants */
+		...
+	    co = PyObject_NEW(PyCodeObject, &PyCode_Type);
+
+	    return co;
+	}
+	```
+	- line 472-511 in **Objects/codeobject.c**: Type Object of code object, it contains slots for all functions you can call on the code object.
+	```c
+	PyTypeObject PyCode_Type = {
+	    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+	    "code",
+		...
+    	(cmpfunc)code_compare,              /* tp_compare */
+		...
+	}
+	```
+	- line 21-38 in ***Include/funcobject.h***: Definition of the Function Object.
+	```c
+	/* Function objects and code objects should not be confused with each other:
+	 *
+	 * Function objects are created by the execution of the 'def' statement.
+	 * They reference a code object in their func_code attribute, which is a
+	 * purely syntactic object, i.e. nothing more than a compiled version of some
+	 * source code lines.  There is one code object per source code "fragment",
+	 * but each code object can be referenced by zero or many function objects
+	 * depending only on how many times the 'def' statement in the source was
+	 * executed so far.
+	 */
+
+	typedef struct {
+	    PyObject_HEAD
+	    PyObject *func_code;	/* A code object */
+	    PyObject *func_globals;	/* A dictionary (other mappings won't do) */
+	    PyObject *func_defaults;	/* NULL or a tuple(default parameters) */
+	    PyObject *func_closure;	/* NULL or a tuple of cell objects */
+	    PyObject *func_doc;		/* The __doc__ attribute, can be anything */
+	    PyObject *func_name;	/* The __name__ attribute, a string object */
+	    PyObject *func_dict;	/* The __dict__ attribute, a dict or NULL */
+	    PyObject *func_weakreflist;	/* List of weak references */
+	    PyObject *func_module;	/* The __module__ attribute, can be anything */
+
+	    /* Invariant:
+	     *     func_closure contains the bindings for func_code->co_freevars, so
+	     *     PyTuple_Size(func_closure) == PyCode_GetNumFree(func_code)
+	     *     (func_closure may be NULL if PyCode_GetNumFree(func_code) == 0).
+	     */
+	} PyFunctionObject;
+	```
+	- line 9-61 in **Objects/funcobject.c**: Function Object = Code Object + Globals
+	```c
+	PyObject *
+	PyFunction_New(PyObject *code, PyObject *globals)
+	{
+		...
+	}
+	```
+	- line 159-174 and line 332-344 in **Objects/funcobj.c**: Maps python name(like ```func_closure```, ```__closure__```) to actual fields in C struct, to allow python code access directly variables defined in C.
+	```c
+	#define OFF(x) offsetof(PyFunctionObject, x)
+
+	/* Read Only */
+	static PyMemberDef func_memberlist[] = {
+	    {"func_closure",  T_OBJECT,     OFF(func_closure),
+	     RESTRICTED|READONLY},
+	    {"__closure__",  T_OBJECT,      OFF(func_closure),
+	     RESTRICTED|READONLY},
+	    {"func_doc",      T_OBJECT,     OFF(func_doc), PY_WRITE_RESTRICTED},
+	    {"__doc__",       T_OBJECT,     OFF(func_doc), PY_WRITE_RESTRICTED},
+	    {"func_globals",  T_OBJECT,     OFF(func_globals),
+	     RESTRICTED|READONLY},
+	    {"__globals__",  T_OBJECT,      OFF(func_globals),
+	     RESTRICTED|READONLY},
+	    {"__module__",    T_OBJECT,     OFF(func_module), PY_WRITE_RESTRICTED},
+	    {NULL}  /* Sentinel */
+	};
+	/* Read and Set */
+	static PyGetSetDef func_getsetlist[] = {
+	    {"func_code", (getter)func_get_code, (setter)func_set_code},
+	    {"__code__", (getter)func_get_code, (setter)func_set_code},
+	    {"func_defaults", (getter)func_get_defaults,
+	     (setter)func_set_defaults},
+	    {"__defaults__", (getter)func_get_defaults,
+	     (setter)func_set_defaults},
+	    {"func_dict", (getter)func_get_dict, (setter)func_set_dict},
+	    {"__dict__", (getter)func_get_dict, (setter)func_set_dict},
+	    {"func_name", (getter)func_get_name, (setter)func_set_name},
+	    {"__name__", (getter)func_get_name, (setter)func_set_name},
+	    {NULL} /* Sentinel */
+	};
+	/* line 547-586: definition of Type Object of the function object */
+	PyTypeObject PyFunction_Type = {
+	    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+	    "function",
+		...
+		/*function_call is used to call the function*/
+    	function_call,                              /* tp_call */
+		...
+	}
+	/* line 487-524 definition of the method function_call */
+	static PyObject *
+	function_call(PyObject *func, PyObject *arg, PyObject *kw)
+	{
+		...
+		/* function PyEval_EvalCodeEx actually get all information
+		 * out from the Function Object and create the frame then
+		 * pass to the interpreter main loop function
+		 * PyEval_EvalFrameEx to execute the function
+		 * 与前面CALL_FUNCTION指令中调用的fast_function应用场景
+		 * 有何不同？
+		 */
+    	result = PyEval_EvalCodeEx(
+    	    (PyCodeObject *)PyFunction_GET_CODE(func),
+    	    PyFunction_GET_GLOBALS(func), (PyObject *)NULL,
+    	    &PyTuple_GET_ITEM(arg, 0), PyTuple_GET_SIZE(arg),
+    	    k, nk, d, nd,
+    	    PyFunction_GET_CLOSURE(func));
+
+    	return result;
+	}
+	```
+1. Closure
+    ![Pic1](pics/Lecture6_01.png)
+    ![Pic1](pics/Lecture6_02.png)
+1. Source Code about instruction LOAD_DEREF
+	- line 2157-2181 in **Python/ceval.c**
+	```c
+        case LOAD_DEREF:
+			/* get name of the environment variables, can get by:
+			 * test3.b2.func_code.co_freevars
+			 */
+            x = freevars[oparg];
+            w = PyCell_Get(x);
+			...
+	```
+	- line 26 and line 33-37 in **Include/funcobject.h**
+	```c
+    PyObject *func_closure;	/* NULL or a tuple of cell objects */
+
+    /* Invariant:
+     *     func_closure contains the bindings for func_code->co_freevars, so
+     *     PyTuple_Size(func_closure) == PyCode_GetNumFree(func_code)
+     *     (func_closure may be NULL if PyCode_GetNumFree(func_code) == 0).
+     */
+	```
+
 ##### Lecture 7 - Iterators
+
+1. Objective: To understand how iterators and 'for' loops work under the hood.
 
 ##### Lecture 8 - User-defined classes and objects
 
