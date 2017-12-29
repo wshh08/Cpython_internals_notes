@@ -6,7 +6,7 @@
 
 	```mermaid
 	graph LR;
-	   srcode[source code]==>compiler((compiler:<br>Standard));
+	   srcode[source code]==>compiler(compiler:<br>Not Very Interesting);
 	   compiler==>bytecode[bytecode]
 	   bytecode==>interpreter(interpreter);
 	   interpreter==>output;
@@ -139,6 +139,10 @@
           if (PyFunction_Check(func))
               x = fast_function(func, pp_stack, n, na, nk);
           else
+	          /* Go this way when call the CALL_FUNCTION instruction
+	           * to make instance of a class, at this time 'func' is
+		       * a Class Objection instead a true Function Object
+	           */
               x = do_call(func, pp_stack, na, nk);
 		  Py_DECREF(func);
         }
@@ -713,8 +717,354 @@
 ##### Lecture 7 - Iterators
 
 1. Objective: To understand how iterators and 'for' loops work under the hood.
+	- Python 'for' loops over a list: ceval.c, abstract.c, listobject.c
+	- Defining a class with a custom iterator: iterator.h, iterobject.c
+1. Iterator: A object that encapsulate the act of iterating. Need have one method called ```next()``` to get the next elememt of iterating.
+	- To make a iterator from a list: ```i = iter(lst)``` or ```i = lst.__iter__()```, then the ```i``` is a iterator object, it's not actually the ```lst```, but it holds a pointer(the pointer can only advance forward, can't go backwards, and iterators in python don't support modification) points to the first element of the list. Everytime call the ```next()``` method on ```i```, will return the current element of the pointer and advance the pointer to the next element in the list. At the very end of the list, call the ```next()``` function will raise a ```StopIteration``` exception.
+	- Why do we need iterator instead of accessing elements by index directly?
+		1. You can make code shorter by iterator.
+		1. You don't need to worry about bound of the index.
+		1. You can define a iterator for a complex data struct(like a tree) and make it retrieve data in the struct in a determined order without worry about the index and its bound.
+	- Python code of using a iterator to print all elements in a list:
+	```python
+	lst = ['a', 'b', 'c']
+	i = lst.__iter__() # 或者 i = iter(lst)
+	while True:
+	    try:
+	        print i.next()
+	    except StopIteration:
+	        break
+	# This for loop implicitly make an iterator to iterate on the list
+	# Code behind a for loop is kind of similar to code above
+	for elt in lst:
+	    print elt
+	```
+	- Using a for loop with builtin iterator to print elements in a dictionary you can only get the keys out in a undeterminaed order.
+	- A ```String``` object also has a builtin iterator that can put  characters in the string out orderly while calling ```next()``` on it.
+1. Instructions of 'for' loop:
+	- ![Pic1](pics/Lecture7_01.png)
+1. Diving into the code of ```GET_ITER``` and ```FOR_ITER```:
+	- line 2493-2528 in **Python/ceval.c**
+	```c
+    case GET_ITER:
+        /* before: [obj]; after [getiter(obj)] */
+        v = TOP();
+        x = PyObject_GetIter(v);
+        Py_DECREF(v);
+        if (x != NULL) {
+            SET_TOP(x);
+	        /* as GET_ITER is always followed by FOR_ITER,
+	         * we can jump to FOR_ITER without go back to the
+	         * main interpreter loop
+	         */
+            PREDICT(FOR_ITER);
+            continue;
+        }
+        STACKADJ(-1);
+        break;
+
+    PREDICTED_WITH_ARG(FOR_ITER);
+    case FOR_ITER:
+        /* before: [iter]; after: [iter, iter()] *or* [] */
+        v = TOP();
+        /* call the next() method on the iterator object */
+        x = (*v->ob_type->tp_iternext)(v);
+        if (x != NULL) {
+            PUSH(x);
+	        /* push the value gotten back to the stack */
+            PREDICT(STORE_FAST);
+            PREDICT(UNPACK_SEQUENCE);
+	        /* go back to the main iterpreter loop and execute the next opcode */
+            continue;
+        }
+        if (PyErr_Occurred()) {
+            if (!PyErr_ExceptionMatches(
+                            PyExc_StopIteration))
+                break;
+            PyErr_Clear();
+        }
+        /* iterator ended normally
+	     * once x == NULL and no exception happend, we'll come here
+         * jump to the instruction of POP_BLOCK and then go back to the 
+	     */
+        x = v = POP();
+        Py_DECREF(v);
+        // #define JUMPBY(x)       (next_instr += (x))
+        JUMPBY(oparg);
+        continue;
+
+	```
+	- line 3066-3090 in **Objects/abstract.c**: definition of the function ```PyObject_GetIter``` - how to get a iterator from a generic object, used by struction ```GET_ITER```. There may be 2 kinds of iterators in Python generic iterator defined by the Type Object and the sequence Iterator for Sequence Objects.
+	```c
+    PyObject *
+    PyObject_GetIter(PyObject *o)
+    {
+        PyTypeObject *t = o->ob_type;
+        getiterfunc f = NULL;
+	    /* if type of the object has a flag py_TPFLAGS_HAVE_ITER
+	     * grab the tp_iter method from the type object
+	     */
+        if (PyType_HasFeature(t, Py_TPFLAGS_HAVE_ITER))
+            f = t->tp_iter;
+        if (f == NULL) {
+	        /* if there is no tp_iter method, see if it's a sequence */
+            if (PySequence_Check(o))
+                /* if it's a sequence object, create a sequence iterator
+	             * from the sequence and then return it
+                 */
+                return PySeqIter_New(o);
+            return type_error("'%.200s' object is not iterable", o);
+        }
+        else {
+            PyObject *res = (*f)(o);
+            if (res != NULL && !PyIter_Check(res)) {
+                PyErr_Format(PyExc_TypeError,
+                             "iter() returned non-iterator "
+                             "of type '%.100s'",
+                             res->ob_type->tp_name);
+                Py_DECREF(res);
+                res = NULL;
+            }
+            return res;
+        }
+    }
+	```
+	- line 11-28 in **Objects/iterobject.c**: definition of the function PySeqIter_New - how to create an iterator for a sequence object.
+	```c
+    PyObject *
+    PySeqIter_New(PyObject *seq)
+    {
+        seqiterobject *it;
+
+        if (!PySequence_Check(seq)) {
+            PyErr_BadInternalCall();
+            return NULL;
+        }
+	    /* create the iterator object */
+        it = PyObject_GC_New(seqiterobject, &PySeqIter_Type);
+        if (it == NULL)
+            return NULL;
+        /* set index of the iterator 0 */
+        it->it_index = 0;
+        Py_INCREF(seq);
+	    /* keep the original sequence object in the iterator for track */
+        it->it_seq = seq;
+        _PyObject_GC_TRACK(it);
+        return (PyObject *)it;
+    }
+	/* line 5-9 in Objects/iterobject.c: definition of a sequence iterator object */
+    typedef struct {
+        PyObject_HEAD
+        long      it_index;
+        PyObject *it_seq; /* Set to NULL when iterator is exhausted */
+    } seqiterobject;
+	/* line 96-127 in Objects/iterobject.c:
+	 * definition of Type Object of sequence iterator object
+	 */
+    PyTypeObject PySeqIter_Type = {
+        PyVarObject_HEAD_INIT(&PyType_Type, 0)
+        "iterator",                                 /* tp_name */
+	    ...
+	    /* method to get next element from the iterator */
+        iter_iternext,                              /* tp_iternext */
+	    ...
+	}
+	/* line 45-71 in Object/iterobject.c: implemention of function iter_iternext */
+    static PyObject *
+    iter_iternext(PyObject *iterator)
+    {
+        seqiterobject *it;
+        PyObject *seq;
+        PyObject *result;
+
+        assert(PySeqIter_Check(iterator));
+        it = (seqiterobject *)iterator;
+		/* get the sequence object */
+        seq = it->it_seq;
+        if (seq == NULL)
+            return NULL;
+
+        /* get the element with it_inddex to return */
+        result = PySequence_GetItem(seq, it->it_index);
+        if (result != NULL) {
+			/* increase the index by 1: core part of the iterating */
+            it->it_index++;
+            return result;
+        }
+        if (PyErr_ExceptionMatches(PyExc_IndexError) ||
+            PyErr_ExceptionMatches(PyExc_StopIteration))
+        {
+            PyErr_Clear();
+            Py_DECREF(seq);
+            it->it_seq = NULL;
+        }
+        return NULL;
+    }
+	```
+	- About the generic(non-sequence object) iterator in python
+		- ![Pic1](pics/Lecture7_02.png)
 
 ##### Lecture 8 - User-defined classes and objects
+
+1. Objective: To understand how Python implements classes and objects
+	- Classes and objects in Python
+	- Include/classobject.h, Objects/classobject.c
+1. Overview:
+	- ![Pic1](pics/Lecture8_01.png)
+	- ![Pic1](pics/Lecture8_02.png)
+1. Source Code
+	- line 1936-1946 in **Python/ceval.c**: about the instruction BUILD_CLASS
+	```c
+    case BUILD_CLASS:
+	    /* get the method dictionary */
+        u = TOP();
+	    /* get the tuple of the names of the base classes */
+        v = SECOND();
+	    /* get the class name */
+        w = THIRD();
+        STACKADJ(-2);
+	    /* build the class object */
+        x = build_class(u, v, w);
+	    /* push the new class object into the stack */
+        SET_TOP(x);
+        Py_DECREF(u);
+        Py_DECREF(v);
+        Py_DECREF(w);
+        break;
+	```
+	- line 4618-4670 in **Python/ceval.c**: definition of function ```build_class(..)```
+	```c
+    static PyObject *
+    build_class(PyObject *methods, PyObject *bases, PyObject *name)
+    {
+	    ...
+	    /* Just image metaclass as a function that
+	     * take name, bases, and methods to build a
+	     * class object. Interpreter will call
+	     * a default metaclass to create a class
+	     * without a specific metaclass.
+	     */
+        result = PyObject_CallFunctionObjArgs(metaclass, name, bases, methods, NULL);
+	    ...
+	    return result
+	}
+	```
+	- line 12-37 in **Include/classobject.h**: Data struct associated with Class Object and Instance of Class.
+	```c
+	/* Class Object */
+    typedef struct {
+        PyObject_HEAD
+        PyObject	*cl_bases;	/* A tuple of class objects */
+        PyObject	*cl_dict;	/* A dictionary */
+        PyObject	*cl_name;	/* A string */
+        /* The following three are functions or NULL */
+        PyObject	*cl_getattr;
+        PyObject	*cl_setattr;
+        PyObject	*cl_delattr;
+        PyObject    *cl_weakreflist; /* List of weak references */
+    } PyClassObject;
+
+    /* Instance Object: instance doesn't store any methods itself */
+    typedef struct {
+        PyObject_HEAD
+	    /* Pointer to class of the instance to get methods(only stored in class) */
+        PyClassObject *in_class;	/* The class object */
+	    /* values of fields in the instance */
+        PyObject	  *in_dict;	/* A dictionary */
+        PyObject	  *in_weakreflist; /* List of weak references */
+    } PyInstanceObject;
+
+	/* Method Object, Method is just a function wrapped with
+	 * a 'self' pointer and a 'class' pointer
+	 */
+    typedef struct {
+        PyObject_HEAD
+	    /* the function */
+        PyObject *im_func;   /* The callable object implementing the method */
+		/* the specific instance that calls the method */
+        PyObject *im_self;   /* The instance it is bound to, or NULL */
+        PyObject *im_class;  /* The class that asked for the method */
+        PyObject *im_weakreflist; /* List of weak references */
+    } PyMethodObject;
+	```
+	- Relation between Method and Function
+		![Pic1](pics/Lecture8_03.png)
+	- Every Instance stores a pointer to its class to get methods(metods are only  stored in the class object) When a instance call a method it will transfer itself as the 'self' parameter to the metod, so that even different instance is excuting the same method in the class, it won't mess up.
+	- Process of creating instance of a class:
+	```viz
+	digraph instance {
+		node [shape = record];
+		initial[label="Call the class name like a function in python code: Counter(5, 7)"]
+		bytecode[label="Compiled into instruction CALL_FUNCTION Counter with parameter 5 and 7"]
+		call_function[label="By definition of Instruction CALL_FUNCTION invoke the function call_function(...) in ceval.c"]
+		do_call[label="as it's a Class Object instead a REAL function, we'll invoke the function do_call(...) in ceval.c"]
+		PyObject_Call[label="invoke the function PyObject_Call(...) definded in abstract.c"]
+		tp_call[label="invoke field tp_call(PyInstance_New) of struct PyClass_Type in classobject.c "]
+		instance_new[label="function PyInstance_New executed and create the Instance Object finally"]
+		initial->bytecode;
+		bytecode->call_function
+		call_function->do_call
+		do_call->PyObject_Call
+		PyObject_Call->tp_call
+		tp_call->instance_new
+	}
+	```
+	- Source Code associated with creation of Insatance
+	```c
+	/* line 444-484 in Objects/classobject.c:
+	 * definition of PyClass_Type - Type Object of the class object
+	 */
+    PyTypeObject PyClass_Type = {
+        PyObject_HEAD_INIT(&PyType_Type)
+        0,
+        "classobj",
+        sizeof(PyClassObject),
+    	...
+        /* called by Instruction CALL_FUNCTION
+         * following the process described above
+	     * when instantiaze a Class
+         */
+        PyInstance_New,                             /* tp_call */
+    	...
+    };
+	/* line 549-598 in Objects/classobject.c:
+	 * implementation of function PyInsatnce_NEW
+	 */
+    PyObject *
+    PyInstance_New(PyObject *klass, PyObject *arg, PyObject *kw)
+    {
+        register PyInstanceObject *inst;
+        PyObject *init;
+        static PyObject *initstr;
+
+        if (initstr == NULL) {
+            initstr = PyString_InternFromString("__init__");
+            if (initstr == NULL)
+                return NULL;
+        }
+	    /* create a unintialized Instance first */
+        inst = (PyInstanceObject *) PyInstance_NewRaw(klass, NULL);
+        /* get the attribute 'init' from the instance*/
+        init = instance_getattr2(inst, initstr);
+        if (init == NULL) {
+		    ...
+		    return null
+		} else {
+	        /* Apply Method Object 'init' on the new instance to initialize it
+	         * with arguments given by Customer code, like Counter(5, 7)
+	         *
+	         * As 'init' is a Method Object and keeps a pointer(im_self) to the
+	         * instance('inst') itself, function PyEval_CallObjectWithKeyword
+	         * doesn't need get 'inst' as a parameter to modify the 'inst'
+	         *
+	         * 'res' is return value of the __init__() method, should be None
+	         */
+            PyObject *res = PyEval_CallObjectWithKeywords(init, arg, kw);
+	        ...
+		}
+        return (PyObject *)inst;
+	}
+	```
 
 ##### Lecture 9 - Generators
 
