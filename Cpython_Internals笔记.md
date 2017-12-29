@@ -467,7 +467,7 @@
 	       get out cheap (don't bother with coercions etc.). */
 	    if (v->ob_type == w->ob_type && !PyInstance_Check(v)) {
 	        cmpfunc fcmp;
-			/* grab the field 'tp_richcompare'(a function pointer) out from the type object and then apply it */
+		    /* grab the field 'tp_richcompare'(a function pointer) out from the type object and then apply it */
 	        richcmpfunc frich = RICHCOMPARE(v->ob_type);
 	        /* If the type has richcmp, try it first.  try_rich_compare
 	           tries it two-sided, which is not needed since we've a
@@ -1067,6 +1067,160 @@
 	```
 
 ##### Lecture 9 - Generators
+
+1. Objective: To see how generators are a more general kind of iterator
+	- recap of the Counter iterator class
+	- Counter re-implemented as a generator
+	- Diving into how CPython implements generators
+1. Concepts about generator
+	- ![Pic1](pics/Lecture9_01.png)
+	- ![Pic1](pics/Lecture9_02.png)
+1. Bytecode about generator
+	- ![Pic1](pics/Lecture9_03.png)
+1. Diving into the source about Generator Object and instruction ```YIELD_VALUE```(NOT VERY CLEAR!!)
+	- line 12-27 in **Include/gebobject.h**: definition of the Generator Object
+	```c
+    typedef struct {
+        PyObject_HEAD
+        /* The gi_ prefix is intended to remind of generator-iterator. */
+
+        /* Note: gi_frame can be NULL if the generator is "finished"
+	     * The frame will be kept in scope until the generator is "finished"
+	     * to maintain the local state, the frame will be poped out the frame stack
+	     * after yield, but it's still alive and the generator keeps track on it
+	     */
+        struct _frame *gi_frame;
+
+        /* True if generator is being executed. */
+        int gi_running;
+
+        /* The code object backing the generator */
+        PyObject *gi_code;
+
+        /* List of weak reference. */
+        PyObject *gi_weakreflist;
+    } PyGenObject;
+	```
+	- line 331-380 in **Objects/genobject.c**: definition of Type Object of Generator Object, the function ```gen_iternext(PyGenObject *gen)``` will be called while iterating on a Generator Object to get the next value
+	```c
+    PyTypeObject PyGen_Type = {
+        PyVarObject_HEAD_INIT(&PyType_Type, 0)
+        "generator",                                /* tp_name */
+	    ...
+	    /* return the generator object itself as a iterator object? */
+        PyObject_SelfIter,                          /* tp_iter */
+	    /* called by the FOR_ITER instruction while iterating on a generator object */
+        (iternextfunc)gen_iternext,                 /* tp_iternext */
+	    ...
+	}
+    /* line 280-284 in Objects/genobject.h: implemention of gen_iternext(...) */
+    static PyObject *
+    gen_iternext(PyGenObject *gen)
+    {
+        return gen_send_ex(gen, NULL, 0);
+    }
+	/* line 44-113 in Objects/genobject.h: implemention of gen_send_ex(...) */
+    static PyObject *
+    gen_send_ex(PyGenObject *gen, PyObject *arg, int exc)
+    {
+        PyThreadState *tstate = PyThreadState_GET();
+	    /* Grab the frame out from the generator object */
+        PyFrameObject *f = gen->gi_frame;
+        PyObject *result;
+
+        if (gen->gi_running) {
+            PyErr_SetString(PyExc_ValueError,
+                            "generator already executing");
+            return NULL;
+        }
+        if (f==NULL || f->f_stacktop == NULL) {
+            /* Only set exception if called from send() */
+            if (arg && !exc)
+                PyErr_SetNone(PyExc_StopIteration);
+            return NULL;
+        }
+
+        if (f->f_lasti == -1) {
+            if (arg && arg != Py_None) {
+                PyErr_SetString(PyExc_TypeError,
+                                "can't send non-None value to a "
+                                "just-started generator");
+                return NULL;
+            }
+        } else {
+            /* Push arg onto the frame's value stack */
+            result = arg ? arg : Py_None;
+            Py_INCREF(result);
+            *(f->f_stacktop++) = result;
+        }
+
+        /* Generators always return to their most recent caller, not
+         * necessarily their creator. */
+        f->f_tstate = tstate;
+        Py_XINCREF(tstate->frame);
+        assert(f->f_back == NULL);
+        f->f_back = tstate->frame;
+
+        gen->gi_running = 1;
+	    /* !!Go back to the interpreter main loop
+	     * to execute the code in the generator
+	     */
+        result = PyEval_EvalFrameEx(f, exc);
+        gen->gi_running = 0;
+
+        /* Don't keep the reference to f_back any longer than necessary.  It
+         * may keep a chain of frames alive or it could create a reference
+         * cycle. */
+        assert(f->f_back == tstate->frame);
+        Py_CLEAR(f->f_back);
+        /* Clear the borrowed reference to the thread state */
+        f->f_tstate = NULL;
+
+        /* If the generator just returned (as opposed to yielding), signal
+         * that the generator is exhausted. */
+        if (result == Py_None && f->f_stacktop == NULL) {
+            Py_DECREF(result);
+            result = NULL;
+            /* Set exception if not called by gen_iternext() */
+            if (arg)
+                PyErr_SetNone(PyExc_StopIteration);
+        }
+
+        if (!result || f->f_stacktop == NULL) {
+            /* generator can't be rerun, so release the frame */
+            Py_DECREF(f);
+            gen->gi_frame = NULL;
+        }
+
+        return result;
+    }
+	```
+	- line 1881-1885 and line 2975-3021 in **Python/ceval.c**: ```YIELD_VALUE``` - the only special instruction of a generator from a regular function
+	```c
+    case YIELD_VALUE:
+	    /* pop up the return value from the value stack */
+        retval = POP();
+        f->f_stacktop = stack_pointer;
+        why = WHY_YIELD;
+        goto fast_yield;
+	    ...
+	    ...
+    fast_yield:
+	    ...
+        if (tstate->frame->f_exc_type != NULL)
+            reset_exc_info(tstate);
+        else {
+            assert(tstate->frame->f_exc_value == NULL);
+            assert(tstate->frame->f_exc_traceback == NULL);
+        }
+    /* pop frame */
+    exit_eval_frame:
+        Py_LeaveRecursiveCall();
+        tstate->frame = f->f_back;
+
+        return retval;
+    }
+	```
 
 没有这个↓↓↓在markdown_preview_enhanced中预览前面的mermaid图都会乱(但是在Chrome中打开后显示正常)，不知为何
 
